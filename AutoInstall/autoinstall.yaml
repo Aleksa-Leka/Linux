@@ -1,4 +1,6 @@
- version: 1
+# Supported releases: Ubuntu Desktop 24.04 LTS (noble) and 26.04 LTS (resolute), amd64
+autoinstall:
+  version: 1
 
   user-data:
     users: [""]
