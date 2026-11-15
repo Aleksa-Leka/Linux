@@ -1,18 +1,60 @@
 # Supported releases: Ubuntu Desktop 24.04 LTS (noble) and 26.04 LTS (resolute), amd64
+# AD Infinitum - based on glueckkanja/IntuneLinuxBaseline (branch ubuntu-26.04-support)
+#
+# Disk encryption is chosen automatically by early-commands:
+#   26.04 + TPM 2.0 + Secure Boot on -> TPM-backed encryption (layout "hybrid"),
+#                                       unlocks at boot without a disk password
+#   everything else (incl. all 24.04) -> LUKS on LVM with a temporary passphrase
+#                                       that the user replaces at first login
+# In both cases a recovery key is saved on the device in
+#   /var/lib/disk-recovery/recovery-key.txt   (root only, inside the encrypted disk)
+# and shown to the user at first login with the request to hand it over to IT.
+# The chosen mode is written to /var/lib/disk-recovery/mode (tpm | luks).
+#
+# STATUS: not yet tested on a VM or real hardware.
 autoinstall:
   version: 1
 
+  # ── Choose the encryption mode before the installer reads the storage section ──
+  # The installer re-reads /autoinstall.yaml after early-commands, so this switches
+  # the storage block below from LUKS (default) to TPM where the device supports it.
+  # If a check fails or the file is not found, the LUKS default stays.
+  early-commands:
+    - |
+      CFG=/autoinstall.yaml
+      M=ENC
+      . /etc/os-release
+      TPM=$(cat /sys/class/tpm/tpm0/tpm_version_major 2>/dev/null || echo 0)
+      SB=$(od -An -t u1 /sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c 2>/dev/null | awk '{print $NF}')
+      echo "release=$VERSION_ID tpm_major=$TPM secureboot=${SB:-none}" > /run/disk-encryption-check
+      if [ "$VERSION_ID" = "26.04" ] && [ "$TPM" = "2" ] && [ "$SB" = "1" ] && [ -f "$CFG" ]; then
+        sed -i -e "/#${M}-LUKS\$/d" -e "s/^\( *\)# \(.*#${M}-TPM\)\$/\1\2/" "$CFG"
+        echo "mode=tpm" >> /run/disk-encryption-check
+      else
+        echo "mode=luks" >> /run/disk-encryption-check
+      fi
+
   user-data:
-    users: [""]
-    disable_root: false
+    users: [""]          # no user at install time: the user creates their account in the first-boot wizard
+    disable_root: true
 
   ssh:
     install-server: no
 
+  # Standard ("extended") desktop selection instead of the minimal default,
+  # so LibreOffice (and the other standard desktop apps) are installed.
+  source:
+    id: ubuntu-desktop
+
+  # Lines ending in #ENC-LUKS are the default. On TPM devices early-commands
+  # deletes them and un-comments the lines ending in #ENC-TPM.
   storage:
     layout:
-      name: lvm
-      password: ubuntu   # Need to be equal with the Script, need to be changed from the User
+      name: lvm                #ENC-LUKS
+      sizing-policy: scaled    #ENC-LUKS
+      password: ubuntu         #ENC-LUKS
+      # name: hybrid           #ENC-TPM
+      # encrypted: yes         #ENC-TPM
 
   # keyboard:
   #   layout: de
@@ -21,190 +63,327 @@ autoinstall:
   updates: security
   shutdown: reboot
 
-  # Mandatory Packages for installing the Intune Requierments
+  # Mandatory Packages for installing the Intune Requirements
   packages:
     - curl
-    - git
     - wget
     - gpg
-    - zenity   # Used by the LUKS first-boot dialog, not guaranteed on every desktop seed
+    - zenity   # Used by the first-login dialogs, not guaranteed on every desktop seed
+    # LibreOffice: already part of the standard selection; listed here as well so it
+    # is installed even if a release drops it from that selection.
+    - libreoffice-writer
+    - libreoffice-calc
+    - libreoffice-impress
 
-  snaps: # (Optional) Install additional apps from this catalog: https://snapcraft.io/store
-    - name: code
-      classic: true
-    - name: postman
-    - name: powershell
-      classic: true
-    - name: sublime-text
-      classic: true
+  snaps:
+    # Canonical's TPM/FDE tool, used on TPM devices to create the IT recovery key.
+    # Harmless on LUKS devices.
+    - name: snap-tpmctl
 
   late-commands:
-###########################################################################
-# Start - LUKS first-boot password-change (GUI, post-login) ───────────────
-###########################################################################
-    #
-    # Approach: two-script design
-    #   luks-change-password-ui.sh   — runs as the logged-in user, shows
-    #                                   zenity dialogs, validates input
-    #   luks-change-password-root.sh — runs as root via sudo (NOPASSWD),
-    #                                   performs the actual cryptsetup call
-    #
-    # Triggered by /etc/xdg/autostart on first desktop login.
-    # Guard file /var/lib/luks-firstboot is removed on success.
-
-    # User-facing UI script
+    # ── Record which encryption mode was actually installed ─────────────────
+    # Decided from the real disk: root on LVM = LUKS, otherwise TPM (hybrid).
     - |
-      cat > /target/usr/local/bin/luks-change-password-ui.sh << 'SCRIPT'
-      #!/bin/bash
+      set -e
+      mkdir -p /target/var/lib/disk-recovery /target/var/lib/first-login
+      chmod 0700 /target/var/lib/disk-recovery
+      chmod 0755 /target/var/lib/first-login
+      ROOT_DEV=$(findmnt -no SOURCE /target)
+      if lvs "$ROOT_DEV" >/dev/null 2>&1; then MODE=luks; else MODE=tpm; fi
+      echo "$MODE" > /target/var/lib/disk-recovery/mode
+      cp /run/disk-encryption-check /target/var/lib/disk-recovery/install-check.txt 2>/dev/null || true
+      # Markers for the first-login dialog (removed when each step is done)
+      touch /target/var/lib/first-login/recovery-handover
+      if [ "$MODE" = luks ]; then touch /target/var/lib/first-login/change-passphrase; fi
 
-      # Exit silently if already completed
-      [ ! -f /var/lib/luks-firstboot ] && exit 0
+    # ── LUKS only: create the recovery key now ──────────────────────────────
+    # A second LUKS key slot with a random 48-digit key (8 groups of 6 digits,
+    # typed with the dashes at the boot prompt). The temporary passphrase
+    # "ubuntu" is replaced at first login; this recovery key slot stays.
+    - |
+      set -e
+      [ "$(cat /target/var/lib/disk-recovery/mode)" = luks ] || exit 0
+      LUKS_NAME=$(lsblk -rno NAME,TYPE | awk '$2=="crypt"{print $1}' | head -1)
+      DEV=$(cryptsetup status "$LUKS_NAME" | awk '/device:/{print $2}')
+      [ -n "$DEV" ]
+      KEY=$(tr -dc 0-9 </dev/urandom | head -c 48 | sed 's/.\{6\}/&-/g; s/-$//')
+      umask 077
+      printf '%s' ubuntu > /run/old.key
+      printf '%s' "$KEY" > /run/new.key
+      cryptsetup luksAddKey --key-file /run/old.key "$DEV" /run/new.key
+      rm -f /run/old.key /run/new.key
+      {
+        echo "DISK RECOVERY KEY"
+        echo "$KEY"
+        echo ""
+        echo "Type: LUKS key slot on $DEV (enter it at the boot password prompt, with the dashes)"
+        echo "Created: $(date -u '+%Y-%m-%d %H:%M UTC') by the installer"
+      } > /target/var/lib/disk-recovery/recovery-key.txt
+      chmod 0600 /target/var/lib/disk-recovery/recovery-key.txt
+
+    # ── TPM only: create the recovery key at first boot ─────────────────────
+    # The installer's own recovery key is only shown in an interactive install,
+    # so a second key named "it-recovery" is created with snap-tpmctl once snapd
+    # is ready (command from Canonical's "Configure hardware-backed disk
+    # encryption" guide). The service retries until it succeeds.
+    - |
+      cat > /target/usr/local/sbin/tpm-recovery-key.sh << 'SCRIPT'
+      #!/bin/bash
+      KEYFILE=/var/lib/disk-recovery/recovery-key.txt
+      [ "$(cat /var/lib/disk-recovery/mode 2>/dev/null)" = tpm ] || exit 0
+      [ -s "$KEYFILE" ] && exit 0
+      snap wait system seed.loaded
+      OUT=$(/snap/bin/snap-tpmctl create-recovery-key it-recovery 2>&1) || { echo "$OUT" >&2; exit 1; }
+      umask 077
+      {
+        echo "DISK RECOVERY KEY"
+        echo "$OUT"
+        echo ""
+        echo "Type: TPM-backed encryption, recovery key name it-recovery (snap-tpmctl list-recovery-keys)"
+        echo "Created: $(date -u '+%Y-%m-%d %H:%M UTC') at first boot"
+      } > "$KEYFILE"
+      SCRIPT
+    - chmod 0700 /target/usr/local/sbin/tpm-recovery-key.sh
+    - |
+      cat > /target/etc/systemd/system/tpm-recovery-key.service << 'EOF'
+      [Unit]
+      Description=Create the IT disk recovery key (TPM-backed encryption)
+      Wants=snapd.seeded.service
+      After=snapd.seeded.service
+      ConditionPathExists=!/var/lib/disk-recovery/recovery-key.txt
+      StartLimitIntervalSec=0
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/tpm-recovery-key.sh
+      Restart=on-failure
+      RestartSec=120
+
+      [Install]
+      WantedBy=multi-user.target
+      EOF
+    - |
+      if [ "$(cat /target/var/lib/disk-recovery/mode)" = tpm ]; then
+        curtin in-target --target=/target -- systemctl enable tpm-recovery-key.service
+      fi
+
+    ###########################################################################
+    # Start - First-login dialog (GUI, post-login) ───────────────────────────
+    ###########################################################################
+    #   first-login-setup.sh  - runs as the logged-in user, shows zenity dialogs:
+    #                           1. LUKS only: replace the temporary disk password
+    #                           2. show the recovery key, ask to hand it to IT
+    #                           3. open the Intune app
+    #   first-login-helper    - runs as root via sudo (NOPASSWD, this file only).
+    #                           Each action only works while its marker file in
+    #                           /var/lib/first-login exists. When all steps are
+    #                           done it removes the sudo rule, the autostart
+    #                           entry and both scripts. The key file stays.
+    - |
+      cat > /target/usr/local/bin/first-login-setup.sh << 'SCRIPT'
+      #!/bin/bash
+      STATE=/var/lib/first-login
+      HELPER=/usr/local/sbin/first-login-helper
+      KEYFILE=/var/lib/disk-recovery/recovery-key.txt
+
+      [ -f "$STATE/change-passphrase" ] || [ -f "$STATE/recovery-handover" ] || exit 0
 
       export DISPLAY="${DISPLAY:-:0}"
       export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$(id -u)/bus}"
 
-      # Opening info dialog — user cannot skip this
-      zenity --info \
-        --title="Disk Encryption Setup" \
-        --width=420 \
-        --text="<b>You must set a permanent disk encryption password.</b>\n\nThe installer used a temporary password that must be replaced before this device can be used.\n\nYou cannot skip this step."
-
-      while true; do
-
-        NEW_PASS=$(zenity --password \
-          --title="Set Encryption Password" \
-          --text="Enter your new encryption password (minimum 12 characters):")
-
-        # User closed dialog — re-show info and loop, cannot escape
-        if [ $? -ne 0 ]; then
-          zenity --warning \
-            --title="Required" \
-            --text="Setting an encryption password is required.\nPlease complete this step."
-          continue
-        fi
-
-        if [ ${#NEW_PASS} -lt 12 ]; then
-          zenity --error \
-            --title="Password Too Short" \
-            --text="The password must be at least 12 characters.\nPlease try again."
-          continue
-        fi
-
-        CONFIRM=$(zenity --password \
-          --title="Confirm Encryption Password" \
-          --text="Confirm your new encryption password:")
-
-        if [ $? -ne 0 ]; then
-          continue
-        fi
-
-        if [ "$NEW_PASS" != "$CONFIRM" ]; then
-          zenity --error \
-            --title="Passwords Do Not Match" \
-            --text="The passwords you entered do not match.\nPlease try again."
-          continue
-        fi
-
-        break
-      done
-
-      # Hand off to root script via sudo (NOPASSWD rule, stdin pipe)
-      echo "$NEW_PASS" | sudo /usr/local/bin/luks-change-password-root.sh
-      RESULT=$?
-
-      if [ $RESULT -eq 0 ]; then
+      # ── Step 1 (LUKS only): replace the temporary disk password ──
+      if [ -f "$STATE/change-passphrase" ]; then
         zenity --info \
-          --title="Encryption Password Set" \
-          --width=380 \
-          --text="<b>Your encryption password has been set successfully.</b>\n\nThis prompt will not appear again."
+          --title="Disk Encryption Setup" \
+          --width=420 \
+          --text="<b>You must set a permanent disk encryption password.</b>\n\nThe installer used a temporary password that must be replaced before this device can be used.\n\nYou will type this password every time the laptop starts.\n\nYou cannot skip this step."
 
-          gtk-launch intune-portal
-      else
-        zenity --error \
-          --title="Error" \
-          --text="Failed to change the encryption password.\nYou will be prompted again on next login."
+        while true; do
+          NEW_PASS=$(zenity --password \
+            --title="Set Encryption Password" \
+            --text="Enter your new encryption password (minimum 12 characters):")
+          if [ $? -ne 0 ]; then
+            zenity --warning --title="Required" \
+              --text="Setting an encryption password is required.\nPlease complete this step."
+            continue
+          fi
+          if [ ${#NEW_PASS} -lt 12 ]; then
+            zenity --error --title="Password Too Short" \
+              --text="The password must be at least 12 characters.\nPlease try again."
+            continue
+          fi
+          CONFIRM=$(zenity --password \
+            --title="Confirm Encryption Password" \
+            --text="Confirm your new encryption password:")
+          [ $? -ne 0 ] && continue
+          if [ "$NEW_PASS" != "$CONFIRM" ]; then
+            zenity --error --title="Passwords Do Not Match" \
+              --text="The passwords you entered do not match.\nPlease try again."
+            continue
+          fi
+          break
+        done
+
+        if printf '%s\n' "$NEW_PASS" | sudo -n "$HELPER" change-passphrase; then
+          zenity --info --title="Encryption Password Set" --width=380 \
+            --text="<b>Your encryption password has been set successfully.</b>"
+        else
+          zenity --error --title="Error" \
+            --text="Failed to change the encryption password.\nYou will be prompted again on next login."
+          exit 1
+        fi
       fi
+
+      # ── Step 2: show the recovery key and ask to hand it over to IT ──
+      if [ -f "$STATE/recovery-handover" ]; then
+        KEY_TEXT=$(sudo -n "$HELPER" show-key)
+        if [ -z "$KEY_TEXT" ]; then
+          zenity --info --title="Disk Recovery Key" --width=420 \
+            --text="Your disk recovery key is still being created.\nIt will be shown at your next login."
+        else
+          {
+            echo "Please hand this recovery key over to IT."
+            echo ""
+            echo "IT needs it to unlock this laptop if the disk cannot be opened normally,"
+            echo "for example after a hardware or firmware change, or if the disk password"
+            echo "is forgotten. Do not keep it only on this laptop."
+            echo ""
+            echo "A copy is stored on this laptop in $KEYFILE"
+            echo "(readable only by an administrator)."
+            echo ""
+            echo "------------------------------------------------------------"
+            echo "$KEY_TEXT"
+            echo "------------------------------------------------------------"
+          } | zenity --text-info \
+                --title="Disk Recovery Key - hand over to IT" \
+                --width=640 --height=440 \
+                --checkbox="I have handed this recovery key over to IT" \
+                --ok-label="Done" --cancel-label="Remind me at next login"
+          if [ $? -eq 0 ]; then
+            sudo -n "$HELPER" handover-done
+          fi
+        fi
+      fi
+
+      # Removes the sudo rule, autostart entry and scripts once every step is done
+      sudo -n "$HELPER" finish
+
+      # ── Step 3: open the Intune app for enrollment ──
+      gtk-launch intune-portal
       SCRIPT
+    - chmod 0755 /target/usr/local/bin/first-login-setup.sh
 
-    - chmod 0755 /target/usr/local/bin/luks-change-password-ui.sh
-
-    # Root script — only called by the UI script via sudo
     - |
-      cat > /target/usr/local/bin/luks-change-password-root.sh << 'SCRIPT'
+      cat > /target/usr/local/sbin/first-login-helper << 'SCRIPT'
       #!/bin/bash
+      STATE=/var/lib/first-login
+      KEYFILE=/var/lib/disk-recovery/recovery-key.txt
+      TEMP_PASS=ubuntu   # must match "password:" in the storage section
 
-      # Read new password from stdin (piped from UI script)
-      read -r NEW_PASS
-
-      # Resolve the LUKS backing device
-      LUKS_DEV=$(lsblk -rno NAME,TYPE | awk '$2=="crypt"{print $1}' | head -1)
-      DEVICE=$(cryptsetup status "$LUKS_DEV" 2>/dev/null | awk '/device:/{print $2}')
-
-      if [ -z "$DEVICE" ]; then
-        echo "ERROR: Could not determine LUKS device" >&2
-        exit 1
-      fi
-
-      # Change the LUKS key: use printf '%s' to avoid trailing newline on both
-      # the old key (stdin) and new key (process substitution) — echo appends \n
-      # which gets stored as part of the key, causing boot-time password mismatch.
-      printf '%s' "ubuntu" | cryptsetup luksChangeKey "$DEVICE" <(printf '%s' "$NEW_PASS")
-
-      if [ $? -eq 0 ]; then
-        rm -f /var/lib/luks-firstboot
-        exit 0
-      else
-        exit 1
-      fi
+      case "${1:-}" in
+        change-passphrase)
+          [ -f "$STATE/change-passphrase" ] || exit 2
+          IFS= read -r NEW_PASS
+          LUKS_DEV=$(lsblk -rno NAME,TYPE | awk '$2=="crypt"{print $1}' | head -1)
+          DEVICE=$(cryptsetup status "$LUKS_DEV" 2>/dev/null | awk '/device:/{print $2}')
+          [ -n "$DEVICE" ] || { echo "ERROR: Could not determine LUKS device" >&2; exit 1; }
+          # Key files without a trailing newline, in a root-only temp dir on tmpfs
+          T=$(umask 077; mktemp -d /run/first-login.XXXXXX)
+          printf '%s' "$TEMP_PASS" > "$T/old"
+          printf '%s' "$NEW_PASS"  > "$T/new"
+          cryptsetup luksChangeKey --key-file "$T/old" "$DEVICE" "$T/new"
+          RC=$?
+          rm -rf "$T"
+          [ $RC -eq 0 ] && rm -f "$STATE/change-passphrase"
+          exit $RC
+          ;;
+        show-key)
+          [ -f "$STATE/recovery-handover" ] || exit 2
+          [ -s "$KEYFILE" ] || exit 0
+          cat "$KEYFILE"
+          ;;
+        handover-done)
+          rm -f "$STATE/recovery-handover"
+          logger -t first-login "User $SUDO_USER confirmed recovery key handover to IT"
+          ;;
+        finish)
+          [ -f "$STATE/change-passphrase" ] || [ -f "$STATE/recovery-handover" ] && exit 0
+          rm -f /etc/sudoers.d/first-login /etc/xdg/autostart/first-login.desktop \
+                /usr/local/bin/first-login-setup.sh
+          rm -f "$0"
+          ;;
+        *) exit 64 ;;
+      esac
       SCRIPT
+    - chmod 0700 /target/usr/local/sbin/first-login-helper
 
-    - chmod 0700 /target/usr/local/bin/luks-change-password-root.sh
-
-    # Sudoers rule — NOPASSWD only for this specific script, nothing else
+    # Sudoers rule - NOPASSWD only for the helper, removed again by "finish"
     - |
-      cat > /target/etc/sudoers.d/luks-change-password << 'EOF'
-      ALL ALL=(root) NOPASSWD: /usr/local/bin/luks-change-password-root.sh
+      cat > /target/etc/sudoers.d/first-login << 'EOF'
+      ALL ALL=(root) NOPASSWD: /usr/local/sbin/first-login-helper
       EOF
+    - chmod 0440 /target/etc/sudoers.d/first-login
 
-    - chmod 0440 /target/etc/sudoers.d/luks-change-password
-
-    # Autostart desktop entry — triggers on first GUI login for any user
+    # Autostart desktop entry - runs at every login until all steps are done
     - mkdir -p /target/etc/xdg/autostart
-
     - |
-      cat > /target/etc/xdg/autostart/luks-change-password.desktop << 'EOF'
+      cat > /target/etc/xdg/autostart/first-login.desktop << 'EOF'
       [Desktop Entry]
       Type=Application
-      Name=Disk Encryption Setup
-      Comment=Set permanent LUKS encryption password on first login
-      Exec=/usr/local/bin/luks-change-password-ui.sh
+      Name=Device Setup
+      Comment=Disk encryption password, recovery key handover and Intune enrollment
+      Exec=/usr/local/bin/first-login-setup.sh
       X-GNOME-Autostart-enabled=true
       X-GNOME-Autostart-Delay=5
       NotifyStartup=false
       EOF
+    ###########################################################################
+    # End - First-login dialog ──────────────────────────────────────────────
+    ###########################################################################
 
-    # Marker file — removed by root script on success
-    - touch /target/var/lib/luks-firstboot
-    ###########################################################################
-    # End - LUKS first-boot password-change (GUI, post-login) ───────────────
-    ###########################################################################
+    # ── Separate 6 GB /var/log/audit filesystem (CIS 1.1.2.7.1-4) ──────────
+    # 6 GB = script 08 cap (40 x 100 MB = about 4 GB) + 1 GB admin_space_left + filesystem overhead.
+    # Mount options nodev,nosuid,noexec = CIS 1.1.2.7.2-4.
+    # LUKS: a 6 GB logical volume in the free space that "sizing-policy: scaled"
+    #       leaves in the encrypted volume group; then the rest of the free space
+    #       is given back to the root volume (otherwise root is capped at 100 GB
+    #       on disks over 200 GB). Needs a disk of at least about 25 GB.
+    # TPM:  the TPM layout has no LVM, so a 6 GB image file on the encrypted root
+    #       is mounted instead. Still a separate filesystem (logs cannot fill the
+    #       root disk, CIS audit passes), but not a real partition.
+    - |
+      set -e
+      ROOT_DEV=$(findmnt -no SOURCE /target)
+      mkdir -p /target/var/log/audit /run/audit-fs
+      if [ "$(cat /target/var/lib/disk-recovery/mode)" = luks ]; then
+        VG=$(lvs --noheadings -o vg_name "$ROOT_DEV" | tr -d ' ')
+        lvcreate -y -L 6G -n audit-lv "$VG"
+        mkfs.ext4 -q -L audit "/dev/$VG/audit-lv"
+        mount "/dev/$VG/audit-lv" /run/audit-fs
+        UUID=$(blkid -s UUID -o value "/dev/$VG/audit-lv")
+        echo "UUID=$UUID /var/log/audit ext4 defaults,nodev,nosuid,noexec 0 2" >> /target/etc/fstab
+        lvextend -r -l +100%FREE "$ROOT_DEV"
+      else
+        fallocate -l 6G /target/var/lib/audit-fs.img
+        chmod 0600 /target/var/lib/audit-fs.img
+        mkfs.ext4 -q -F -L audit /target/var/lib/audit-fs.img
+        mount -o loop /target/var/lib/audit-fs.img /run/audit-fs
+        echo "/var/lib/audit-fs.img /var/log/audit ext4 loop,defaults,nodev,nosuid,noexec 0 0" >> /target/etc/fstab
+      fi
+      chmod 0750 /run/audit-fs
+      umount /run/audit-fs
 
     # ── Disable Ubuntu telemetry prompt ─────────────────────────────────────
     # 24.04 ships ubuntu-report; 26.04 replaces it with ubuntu-insights.
     - curtin in-target --target=/target -- sh -c 'if command -v ubuntu-report >/dev/null 2>&1; then ubuntu-report send no; fi'
     - curtin in-target --target=/target -- sh -c 'if command -v ubuntu-insights >/dev/null 2>&1; then ubuntu-insights consent --state=false || true; fi'
 
-    # ── Disable GNOME initial setup wizard + Ubuntu Pro prompt ───────────────
-    # Keep the package installed but mark setup as done system-wide.
-    # This is the official enterprise approach — gnome-initial-setup checks
-    # for this file and skips the entire wizard for all users.
+    # ── Skip GNOME initial setup pages + Ubuntu Pro prompt ──────────────────
+    # The account page is NOT skipped: the user creates their account here.
     - mkdir -p /target/etc/gnome-initial-setup
     - curtin in-target --target=/target -- sh -c 'echo "[pages]" > /etc/gnome-initial-setup/vendor.conf'
     - curtin in-target --target=/target -- sh -c 'echo "skip=language;keyboard;privacy;software;parental-controls;ubuntu-pro" >> /etc/gnome-initial-setup/vendor.conf'
     - curtin in-target --target=/target -- systemctl mask ubuntu-advantage-desktop-daemon
-
-    # - mkdir -p /target/etc/skel/.config
-    # - touch /target/etc/skel/.config/gnome-initial-setup-done
 
     # Also disable Ubuntu Pro background notifications (apt_news, MOTD ads)
     - curtin in-target --target=/target -- pro config set apt_news=false
@@ -216,9 +395,9 @@ autoinstall:
     #   26.04 → ubuntu/26.04/prod resolute  (signed with microsoft-2025.asc)
     # The Edge repo is signed with the legacy microsoft.asc key on all releases.
     - curtin in-target --target=/target -- mkdir -p /tmp/microsoft
-    - curtin in-target --target=/target -- sh -c 'curl -sSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor > /tmp/microsoft/microsoft.gpg'
+    - curtin in-target --target=/target -- sh -c 'curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor > /tmp/microsoft/microsoft.gpg'
     - curtin in-target --target=/target -- install -o root -g root -m 644 /tmp/microsoft/microsoft.gpg /usr/share/keyrings/microsoft.gpg
-    - curtin in-target --target=/target -- sh -c 'curl -sSL https://packages.microsoft.com/keys/microsoft-2025.asc | gpg --dearmor > /tmp/microsoft/microsoft-2025.gpg'
+    - curtin in-target --target=/target -- sh -c 'curl -fsSL https://packages.microsoft.com/keys/microsoft-2025.asc | gpg --dearmor > /tmp/microsoft/microsoft-2025.gpg'
     - curtin in-target --target=/target -- install -o root -g root -m 644 /tmp/microsoft/microsoft-2025.gpg /usr/share/keyrings/microsoft-2025.gpg
 
     - |
@@ -232,18 +411,40 @@ autoinstall:
         echo "deb [arch=amd64 signed-by=$KEYRING] https://packages.microsoft.com/ubuntu/$VERSION_ID/prod $VERSION_CODENAME main" > "/etc/apt/sources.list.d/microsoft-ubuntu-$VERSION_CODENAME-prod.list"
       '
 
+    # Edge repo: we own the repo file. Edge's package scripts (like Chrome's) add
+    # their own repo entry and a key in trusted.gpg.d unless told not to. That
+    # second entry without "signed-by" makes apt fail with "Conflicting values set
+    # for option Signed-By" or NO_PUBKEY, which breaks every later apt install.
+    # /etc/default/microsoft-edge stops the package from adding it (set before install).
+    - |
+      cat > /target/etc/default/microsoft-edge << 'EOF'
+      repo_add_once="false"
+      repo_reenable_on_distupgrade="false"
+      EOF
     - curtin in-target --target=/target -- sh -c 'echo "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft.gpg] https://packages.microsoft.com/repos/edge stable main" > /etc/apt/sources.list.d/microsoft-edge.list'
 
     - curtin in-target --target=/target -- apt-get update
     - curtin in-target --target=/target -- apt-get install -y intune-portal microsoft-edge-stable
 
-    - rm -f /target/etc/apt/sources.list.d/microsoft-edge-dev.list
-    - rm -f /target/etc/apt/trusted.gpg.d/microsoft.gpg
+    # After install: remove any Edge repo entries or keys the package added anyway,
+    # then write our repo file again (the package may have overwritten it).
+    - |
+      for f in /target/etc/apt/sources.list.d/microsoft-edge*; do
+        [ -e "$f" ] || continue
+        [ "$f" = /target/etc/apt/sources.list.d/microsoft-edge.list ] || rm -f "$f"
+      done
+    - rm -f /target/etc/apt/trusted.gpg.d/microsoft.gpg /target/etc/apt/trusted.gpg.d/microsoft-edge.gpg
+    - curtin in-target --target=/target -- sh -c 'echo "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft.gpg] https://packages.microsoft.com/repos/edge stable main" > /etc/apt/sources.list.d/microsoft-edge.list'
     - curtin in-target --target=/target -- rm -rf /tmp/microsoft
 
-    # Remove bloatware
-    - curtin in-target --target=/target -- apt-get purge -y libreoffice* remmina* transmission*
+    # Remove bloatware (LibreOffice is kept). Patterns are quoted so the shell
+    # does not expand them; "|| true" so a missing package cannot fail the install.
+    - curtin in-target --target=/target -- sh -c "apt-get purge -y 'remmina*' 'transmission*' || true"
 
     # Clean up
     - curtin in-target --target=/target -- apt-get autoremove -y
     - curtin in-target --target=/target -- apt-get clean
+
+    # Check that apt works with the final repo setup. Does not stop the install;
+    # result in /var/log/autoinstall-apt-check.log (look for "W:" / "E:" lines).
+    - curtin in-target --target=/target -- sh -c 'apt-get update > /var/log/autoinstall-apt-check.log 2>&1 || true'
