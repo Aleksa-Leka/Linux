@@ -449,27 +449,29 @@ autoinstall:
     - curtin in-target --target=/target -- pro config set apt_news=false
 
     # ── Install Microsoft Intune Portal + Edge ───────────────────────────────
-    # The release and codename are read from the installed system so the
-    # matching packages.microsoft.com repo is used:
-    #   24.04 → ubuntu/24.04/prod noble     (signed with microsoft.asc)
-    #   26.04 → ubuntu/26.04/prod resolute  (signed with microsoft-2025.asc)
+    # Prod repo: install Microsoft's own repo-config package
+    # (packages-microsoft-prod.deb) for this release. It writes
+    #   /etc/apt/sources.list.d/microsoft-prod.list
+    #   /usr/share/keyrings/microsoft-prod.gpg
+    # (24.04 = microsoft.asc key, 26.04 = microsoft-2025.asc key, checked 16 Nov 2026).
+    # Defender for Endpoint and Microsoft's install guides use exactly these
+    # names, so a later Defender/Teams/etc. install adds nothing new. Using our
+    # own file/key names caused "Conflicting values set for option Signed-By"
+    # (microsoft-prod.gpg != microsoft-2025.gpg) on 26.04.
     # The Edge repo is signed with the legacy microsoft.asc key on all releases.
     - curtin in-target --target=/target -- mkdir -p /tmp/microsoft
-    - curtin in-target --target=/target -- sh -c 'curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor > /tmp/microsoft/microsoft.gpg'
-    - curtin in-target --target=/target -- install -o root -g root -m 644 /tmp/microsoft/microsoft.gpg /usr/share/keyrings/microsoft.gpg
-    - curtin in-target --target=/target -- sh -c 'curl -fsSL https://packages.microsoft.com/keys/microsoft-2025.asc | gpg --dearmor > /tmp/microsoft/microsoft-2025.gpg'
-    - curtin in-target --target=/target -- install -o root -g root -m 644 /tmp/microsoft/microsoft-2025.gpg /usr/share/keyrings/microsoft-2025.gpg
-
     - |
       curtin in-target --target=/target -- sh -c '
         . /etc/os-release
         case "$VERSION_ID" in
-          24.04) KEYRING=/usr/share/keyrings/microsoft.gpg ;;
-          26.04) KEYRING=/usr/share/keyrings/microsoft-2025.gpg ;;
+          24.04|26.04) ;;
           *) echo "Unsupported Ubuntu release for Intune: $VERSION_ID" >&2; exit 1 ;;
         esac
-        echo "deb [arch=amd64 signed-by=$KEYRING] https://packages.microsoft.com/ubuntu/$VERSION_ID/prod $VERSION_CODENAME main" > "/etc/apt/sources.list.d/microsoft-ubuntu-$VERSION_CODENAME-prod.list"
+        curl -fsSL -o /tmp/microsoft/packages-microsoft-prod.deb "https://packages.microsoft.com/config/ubuntu/$VERSION_ID/packages-microsoft-prod.deb"
+        dpkg -i /tmp/microsoft/packages-microsoft-prod.deb
       '
+    - curtin in-target --target=/target -- sh -c 'curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor > /tmp/microsoft/microsoft.gpg'
+    - curtin in-target --target=/target -- install -o root -g root -m 644 /tmp/microsoft/microsoft.gpg /usr/share/keyrings/microsoft.gpg
 
     # Edge repo: we own the repo file. Edge's package scripts (like Chrome's) add
     # their own repo entry and a key in trusted.gpg.d unless told not to. That
