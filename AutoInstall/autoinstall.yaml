@@ -11,14 +11,21 @@
 # and shown to the user at first login with the request to hand it over to IT.
 # The chosen mode is written to /var/lib/disk-recovery/mode (tpm | luks).
 #
-# STATUS: not yet tested on a VM or real hardware.
+# STATUS (2026-11-16): LUKS path tested in a VM (boots, temp passphrase works).
+#   Real laptop with old TPM firmware failed with the previous TPM check; the snapd-based
+#   check below now falls back to LUKS (mock-tested only). TPM path and TPM recovery-key
+#   capture not yet tested on real hardware.
 autoinstall:
   version: 1
 
   # ── Choose the encryption mode before the installer reads the storage section ──
   # The installer re-reads /autoinstall.yaml after early-commands, so this switches
   # the storage block below from LUKS (default) to TPM where the device supports it.
-  # If a check fails or the file is not found, the LUKS default stays.
+  # TPM is chosen only when snapd on the live system answers "available" to the
+  # same TPM check the installer runs (GET /v2/systems/<label> -> storage-encryption).
+  # Any other answer, a TPM firmware error, or a failed query keeps the LUKS default,
+  # so a TPM problem gives a LUKS install instead of an AutoinstallError.
+  # Result and reason: /run/disk-encryption-check (copied to the target in late-commands).
   early-commands:
     - |
       CFG=/autoinstall.yaml
@@ -27,7 +34,29 @@ autoinstall:
       TPM=$(cat /sys/class/tpm/tpm0/tpm_version_major 2>/dev/null || echo 0)
       SB=$(od -An -t u1 /sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c 2>/dev/null | awk '{print $NF}')
       echo "release=$VERSION_ID tpm_major=$TPM secureboot=${SB:-none}" > /run/disk-encryption-check
-      if [ "$VERSION_ID" = "26.04" ] && [ "$TPM" = "2" ] && [ "$SB" = "1" ] && [ -f "$CFG" ]; then
+      SNAPD=skipped
+      if [ "$VERSION_ID" = "26.04" ] && [ "$TPM" = "2" ] && [ "$SB" = "1" ]; then
+        SNAPD=$(timeout 120 python3 - 2>&1 << 'PY' || true
+      import http.client, json, socket
+      class C(http.client.HTTPConnection):
+          def connect(self):
+              self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+              self.sock.connect("/run/snapd.socket")
+      def get(path):
+          c = C("localhost", timeout=110); c.request("GET", path)
+          return json.loads(c.getresponse().read())["result"]
+      found = []
+      for s in get("/v2/systems").get("systems") or []:
+          enc = get("/v2/systems/" + s["label"]).get("storage-encryption") or {}
+          errs = [e.get("kind", "") + ": " + e.get("message", "") for e in enc.get("availability-check-errors") or []]
+          found.append("label=%s support=%s reason=%s %s" % (s["label"], enc.get("support"),
+                       enc.get("unavailable-reason", ""), " | ".join(errs)))
+      print("\n".join(found) if found else "no-systems")
+      PY
+        )
+      fi
+      echo "snapd: $SNAPD" >> /run/disk-encryption-check
+      if [ -f "$CFG" ] && echo "$SNAPD" | grep -q "support=available"; then
         sed -i -e "/#${M}-LUKS\$/d" -e "s/^\( *\)# \(.*#${M}-TPM\)\$/\1\2/" "$CFG"
         echo "mode=tpm" >> /run/disk-encryption-check
       else
@@ -121,11 +150,42 @@ autoinstall:
       } > /target/var/lib/disk-recovery/recovery-key.txt
       chmod 0600 /target/var/lib/disk-recovery/recovery-key.txt
 
-    # ── TPM only: create the recovery key at first boot ─────────────────────
-    # The installer's own recovery key is only shown in an interactive install,
-    # so a second key named "it-recovery" is created with snap-tpmctl once snapd
-    # is ready (command from Canonical's "Configure hardware-backed disk
-    # encryption" guide). The service retries until it succeeds.
+    # ── TPM only: save the installer's recovery key during the install ──────
+    # For TPM installs the installer asks snapd for a recovery key just before
+    # it finishes, keeps it in memory and offers it on its API (subiquity source:
+    # server/controllers/install.py and storage.py, endpoint
+    # GET /storage/v2/core_boot_recovery_key); the desktop installer shows it
+    # to the user from there. An unattended install shows nobody, so it is read
+    # here and saved, so the laptop has a known key from its very first boot.
+    # Not fatal: if it fails, the first-boot service below creates a key instead.
+    - |
+      [ "$(cat /target/var/lib/disk-recovery/mode)" = tpm ] || exit 0
+      python3 - << 'PY' || echo "tpm_key_from_installer=failed" >> /target/var/lib/disk-recovery/install-check.txt
+      import datetime, http.client, json, os, socket
+      class UnixConn(http.client.HTTPConnection):
+          def connect(self):
+              self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+              self.sock.connect("/run/subiquity/socket")
+      c = UnixConn("localhost", timeout=30)
+      c.request("GET", "/storage/v2/core_boot_recovery_key")
+      r = c.getresponse()
+      body = r.read().decode()
+      if r.status != 200:
+          raise SystemExit("HTTP %s: %s" % (r.status, body))
+      key = json.loads(body)
+      path = "/target/var/lib/disk-recovery/recovery-key.txt"
+      fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+      with os.fdopen(fd, "w") as f:
+          f.write("DISK RECOVERY KEY\n%s\n\n" % key)
+          f.write("Type: TPM-backed encryption, default recovery key (default-recovery)\n")
+          f.write("Created: %s by the installer\n" % datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
+      PY
+
+    # ── TPM only, fallback: create a recovery key at first boot ─────────────
+    # Only runs if the step above did not save a key. Creates a second key named
+    # "it-recovery" with snap-tpmctl once snapd is ready (command from Canonical's
+    # "Configure hardware-backed disk encryption" guide). Retries until it works.
+    # Note: until it works, a TPM laptop that fails to unlock has no known key.
     - |
       cat > /target/usr/local/sbin/tpm-recovery-key.sh << 'SCRIPT'
       #!/bin/bash
